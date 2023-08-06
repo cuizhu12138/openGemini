@@ -147,6 +147,14 @@ func Compile(stmt *influxql.SelectStatement, opt CompileOptions) (Statement, err
 
 	// Convert PERCENTILE_OGSKETCH into the PERCENTILE_APPROX
 	c.stmt.RewritePercentileOGSketch()
+
+	if inCond, ok := c.stmt.Condition.(*influxql.InCondition); ok {
+		st, err := Compile(inCond.Stmt, CompileOptions{})
+		if err != nil {
+			return nil, err
+		}
+		inCond.Stmt = st.(*compiledStatement).stmt
+	}
 	return c, nil
 }
 
@@ -1522,10 +1530,9 @@ func (c *compiledStatement) Prepare(shardMapper ShardMapper, sopt SelectOptions)
 		return nil, err
 	}
 
-	seriesKey := shardMapper.GetSeriesKey()
-	if len(seriesKey) != 0 && (isFullSeriesQuery || isSpecificSeriesQuery) {
+	if len(shards.GetSeriesKey()) != 0 && (isFullSeriesQuery || isSpecificSeriesQuery) {
 		opt.SetHintType(hybridqp.FullSeriesQuery)
-		opt.SeriesKey = append(opt.SeriesKey, seriesKey...)
+		opt.SeriesKey = append(opt.SeriesKey, shards.GetSeriesKey()...)
 	}
 
 	opt.StartTime, opt.EndTime = c.TimeRange.MinTimeNano(), c.TimeRange.MaxTimeNano()

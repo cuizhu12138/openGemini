@@ -62,6 +62,9 @@ const (
 
 	// MinRetentionPolicyDuration represents the minimum duration for a policy.
 	MinRetentionPolicyDuration = time.Hour
+
+	// QueryIDSpan is the default id range span.
+	QueryIDSpan = 100000000 // 100 million
 )
 
 const (
@@ -71,6 +74,8 @@ const (
 )
 
 var dropStreamFirstError = errors.New("stream task exists, drop it first")
+
+type SQLHost string
 
 func assert(condition bool, msg string, v ...interface{}) {
 	if !condition {
@@ -86,14 +91,18 @@ type Data struct {
 	ClusterPtNum uint32 // default number is the total cpu number of 16 nodes.
 	PtNumPerNode uint32
 
-	MetaNodes []NodeInfo
-	DataNodes []DataNode           // data nodes
-	PtView    map[string]DBPtInfos // PtView's key is dbname, value is PtInfo's slice.
+	MetaNodes     []NodeInfo
+	DataNodes     []DataNode                // data nodes
+	PtView        map[string]DBPtInfos      // PtView's key is dbname, value is PtInfo's slice.
+	ReplicaGroups map[string][]ReplicaGroup // key is dbname, value is the replication group of the database
 
 	Databases     map[string]*DatabaseInfo
 	Streams       map[string]*StreamInfo
 	Users         []UserInfo
 	MigrateEvents map[string]*MigrateEventInfo
+
+	// Query ID range segment allocated by all sql nodes
+	QueryIDInit map[SQLHost]uint64 // {"127.0.0.1:8086": 0, "127.0.0.2:8086": 10w, "127.0.0.3:8086": 20w}, span is QueryIDSpan
 
 	// adminUserExists provides a constant time mechanism for determining
 	// if there is at least one admin GetUser.
@@ -890,6 +899,17 @@ func (data *Data) CloneMetaNodes() []NodeInfo {
 	return mns
 }
 
+func (data *Data) CloneQueryIDInit() map[SQLHost]uint64 {
+	if data.QueryIDInit == nil {
+		return nil
+	}
+	cloneIdInit := make(map[SQLHost]uint64, len(data.QueryIDInit))
+	for host := range data.QueryIDInit {
+		cloneIdInit[host] = data.QueryIDInit[host]
+	}
+	return cloneIdInit
+}
+
 // assign db to all data nodes that have been joined.
 func (data *Data) createDBPtView(name string) error {
 	if data.PtView == nil {
@@ -1580,7 +1600,7 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time,
 	}
 
 	//check index group contain this shard group
-	igi := data.createIndexGroupIfNeeded(rpi, timestamp)
+	igi := data.createIndexGroupIfNeeded(rpi, timestamp, engineType)
 
 	for i := range sgi.Shards {
 		data.MaxShardID++
@@ -1609,7 +1629,7 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time,
 	return nil
 }
 
-func (data *Data) CreateIndexGroup(rpi *RetentionPolicyInfo, timestamp time.Time) *IndexGroupInfo {
+func (data *Data) CreateIndexGroup(rpi *RetentionPolicyInfo, timestamp time.Time, engineType config.EngineType) *IndexGroupInfo {
 	data.MaxIndexGroupID++
 	igi := IndexGroupInfo{}
 	igi.ID = data.MaxIndexGroupID
@@ -1618,6 +1638,7 @@ func (data *Data) CreateIndexGroup(rpi *RetentionPolicyInfo, timestamp time.Time
 	if igi.EndTime.After(time.Unix(0, models.MaxNanoTime)) {
 		igi.EndTime = time.Unix(0, models.MaxNanoTime+1)
 	}
+	igi.EngineType = engineType
 	igi.Indexes = make([]IndexInfo, data.ClusterPtNum)
 	for i := range igi.Indexes {
 		data.MaxIndexID++
@@ -1628,21 +1649,21 @@ func (data *Data) CreateIndexGroup(rpi *RetentionPolicyInfo, timestamp time.Time
 	return &igi
 }
 
-func (data *Data) createIndexGroupIfNeeded(rpi *RetentionPolicyInfo, timestamp time.Time) *IndexGroupInfo {
+func (data *Data) createIndexGroupIfNeeded(rpi *RetentionPolicyInfo, timestamp time.Time, engineType config.EngineType) *IndexGroupInfo {
 	if len(rpi.IndexGroups) == 0 {
-		return data.CreateIndexGroup(rpi, timestamp)
+		return data.CreateIndexGroup(rpi, timestamp, engineType)
 	}
 
 	var igIdx int
 	for igIdx = 0; igIdx < len(rpi.IndexGroups); igIdx++ {
-		if rpi.IndexGroups[igIdx].Contains(timestamp) {
+		if rpi.IndexGroups[igIdx].EngineType == engineType && rpi.IndexGroups[igIdx].Contains(timestamp) {
 			break
 		}
 	}
 	if igIdx < len(rpi.IndexGroups) && len(rpi.IndexGroups[igIdx].Indexes) >= int(data.ClusterPtNum) {
 		return &rpi.IndexGroups[igIdx]
 	}
-	return data.CreateIndexGroup(rpi, timestamp)
+	return data.CreateIndexGroup(rpi, timestamp, engineType)
 }
 
 func (data *Data) expendDBPtView(database string, ptNum uint32) {
@@ -1685,7 +1706,7 @@ func (data *Data) ExpandGroups() {
 
 			rp.walkShardGroups(func(sg *ShardGroupInfo) {
 				for i := len(sg.Shards); i < int(data.ClusterPtNum); i++ {
-					igi := data.createIndexGroupIfNeeded(rp, sg.StartTime)
+					igi := data.createIndexGroupIfNeeded(rp, sg.StartTime, sg.EngineType)
 					data.MaxShardID++
 					sg.Shards = append(sg.Shards, ShardInfo{ID: data.MaxShardID, Owners: []uint32{uint32(i)}, IndexID: igi.Indexes[i].ID, Tier: sg.Shards[i-1].Tier})
 				}
@@ -1983,7 +2004,7 @@ func (data *Data) SetAdminPrivilege(name string, admin bool) error {
 }
 
 // AdminUserExist returns true if an admin GetUser exists.
-func (data Data) AdminUserExist() bool {
+func (data *Data) AdminUserExist() bool {
 	return data.AdminUserExists
 }
 
@@ -2026,6 +2047,9 @@ func (data *Data) Clone() *Data {
 	other.Users = data.CloneUsers()
 	other.PtView = data.CloneDBPtView()
 	other.MigrateEvents = data.CloneMigrateEvents()
+
+	other.QueryIDInit = data.CloneQueryIDInit()
+
 	return &other
 }
 
@@ -2101,6 +2125,24 @@ func (data *Data) Marshal() *proto2.Data {
 		pb.MigrateEvents[i] = data.MigrateEvents[eventStr].marshal()
 		i++
 	}
+
+	pb.QueryIDInit = make(map[string]uint64, len(data.QueryIDInit))
+	for host := range data.QueryIDInit {
+		pb.QueryIDInit[string(host)] = data.QueryIDInit[host]
+	}
+
+	if len(data.ReplicaGroups) > 0 {
+		pb.ReplicaGroups = make(map[string]*proto2.Replications, len(data.ReplicaGroups))
+		for dbname, repls := range data.ReplicaGroups {
+			replication := &proto2.Replications{
+				Groups: make([]*proto2.ReplicaGroup, len(repls)),
+			}
+			for i = range repls {
+				replication.Groups[i] = repls[i].marshal()
+			}
+			pb.ReplicaGroups[dbname] = replication
+		}
+	}
 	return pb
 }
 
@@ -2117,7 +2159,6 @@ func (data *Data) Unmarshal(pb *proto2.Data) {
 	data.PtNumPerNode = pb.GetPtNumPerNode()
 	data.MaxIndexGroupID = pb.GetMaxIndexGroupID()
 	data.MaxIndexID = pb.GetMaxIndexID()
-	data.DataNodes = make([]DataNode, len(pb.GetDataNodes()))
 	data.MaxEventOpId = pb.GetMaxEventOpId()
 	data.TakeOverEnabled = pb.GetTakeOverEnabled()
 	data.BalancerEnabled = pb.GetBalancerEnabled()
@@ -2125,6 +2166,7 @@ func (data *Data) Unmarshal(pb *proto2.Data) {
 	data.MaxStreamID = pb.GetMaxStreamID()
 	data.MaxConnID = pb.GetMaxConnId()
 
+	data.DataNodes = make([]DataNode, len(pb.GetDataNodes()))
 	for i, x := range pb.GetDataNodes() {
 		data.DataNodes[i].unmarshal(x)
 	}
@@ -2173,6 +2215,22 @@ func (data *Data) Unmarshal(pb *proto2.Data) {
 	// Exhaustively determine if there is an admin GetUser. The marshalled cache
 	// value may not be correct.
 	data.AdminUserExists = data.HasAdminUser()
+
+	data.QueryIDInit = make(map[SQLHost]uint64, len(pb.GetQueryIDInit()))
+	for host := range pb.QueryIDInit {
+		data.QueryIDInit[SQLHost(host)] = pb.QueryIDInit[host]
+	}
+
+	if len(pb.ReplicaGroups) == 0 {
+		return
+	}
+	data.ReplicaGroups = make(map[string][]ReplicaGroup, len(pb.ReplicaGroups))
+	for dbname, rgs := range pb.ReplicaGroups {
+		data.ReplicaGroups[dbname] = make([]ReplicaGroup, len(rgs.Groups))
+		for i := range rgs.Groups {
+			data.ReplicaGroups[dbname][i].unmarshal(rgs.Groups[i])
+		}
+	}
 }
 
 // MarshalBinary encodes the metadata to a binary format.
@@ -2819,6 +2877,24 @@ func (data *Data) checkDDLConflict(e *proto2.MigrateEventInfo) error {
 			}
 		}
 	}
+	return nil
+}
+
+// RegisterQueryIDOffset register the mapping relationship between its host and query id offset for ts-sql
+func (data *Data) RegisterQueryIDOffset(host SQLHost) error {
+	if data.QueryIDInit == nil {
+		data.QueryIDInit = make(map[SQLHost]uint64)
+	}
+
+	if _, ok := data.QueryIDInit[host]; ok {
+		return nil
+	}
+
+	currentAssignedNum := len(data.QueryIDInit)
+	newOffset := uint64(currentAssignedNum * QueryIDSpan)
+
+	data.QueryIDInit[host] = newOffset
+
 	return nil
 }
 

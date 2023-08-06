@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,7 @@ func init() {
 	RetryGetUserInfoTimeout = 1 * time.Second
 	RetryExecTimeout = 1 * time.Second
 	RetryReportTimeout = 1 * time.Second
+	HttpReqTimeout = 1 * time.Second
 }
 
 type RPCServer struct {
@@ -426,6 +428,53 @@ func TestClient_CreateShardGroup(t *testing.T) {
 
 	_, err := c.CreateShardGroup("db0", "rp0", time.Now(), config.COLUMNSTORE)
 	require.EqualError(t, err, "execute command timeout")
+}
+
+func TestClient_GetShardInfoByTime(t *testing.T) {
+	ts := time.Now()
+	sgInfo1 := meta2.ShardGroupInfo{ID: 1, StartTime: ts, EndTime: time.Now().Add(time.Duration(3600)), DeletedAt: time.Time{},
+		Shards: []meta2.ShardInfo{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}}, EngineType: config.COLUMNSTORE}
+	c := &Client{
+		cacheData: &meta2.Data{
+			Databases: map[string]*meta2.DatabaseInfo{"db0": {
+				Name:     "db0",
+				ShardKey: meta2.ShardKeyInfo{ShardKey: []string{"tag1", "tag2"}},
+				RetentionPolicies: map[string]*meta2.RetentionPolicyInfo{
+					"rp0": {
+						Name:         "rp0",
+						Duration:     72 * time.Hour,
+						Measurements: map[string]*meta2.MeasurementInfo{"mst0": {Name: "mst0"}},
+						ShardGroups:  []meta2.ShardGroupInfo{sgInfo1},
+					},
+				}},
+			},
+			PtView: map[string]meta2.DBPtInfos{
+				"db0": []meta2.PtInfo{{
+					PtId: 0, Owner: meta2.PtOwner{NodeID: 0}, Status: meta2.Online},
+					{PtId: 1, Owner: meta2.PtOwner{NodeID: 1}, Status: meta2.Online}},
+			},
+		},
+		metaServers: []string{"127.0.0.1"},
+		logger:      logger.NewLogger(errno.ModuleMetaClient),
+	}
+
+	_, err := c.GetShardInfoByTime("db0", "rp0", ts, 0, 0, config.COLUMNSTORE)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.GetShardInfoByTime("db1", "rp0", ts, 0, 0, config.COLUMNSTORE)
+	assert.Equal(t, errno.Equal(err, errno.DatabaseNotFound), true)
+
+	_, err = c.GetShardInfoByTime("db0", "rp0", time.Unix(0, 0), 0, 0, config.COLUMNSTORE)
+	assert.Equal(t, errno.Equal(err, errno.ShardNotFound), true)
+
+	_, err = c.GetShardInfoByTime("db0", "rp0", ts, 2, 2, config.COLUMNSTORE)
+	assert.Equal(t, strings.Contains(err.Error(), fmt.Sprintf("nodeId cannot find pt")), true)
+
+	c.cacheData.PtView["db0"] = nil
+	_, err = c.GetShardInfoByTime("db0", "rp0", ts, 0, 0, config.COLUMNSTORE)
+	assert.Equal(t, strings.Contains(err.Error(), fmt.Sprintf("db db0 in PtView not exist")), true)
 }
 
 func TestClient_CreateMeasurement(t *testing.T) {
@@ -1157,5 +1206,67 @@ func TestInitMetaClient(t *testing.T) {
 	_, _, _, err = mc.InitMetaClient(joinPeers, true, info)
 	if err != nil {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestClient_RetryRegisterQueryIDOffset(t *testing.T) {
+	type fields struct {
+		metaServers []string
+		cacheData   *meta2.Data
+		logger      *logger.Logger
+	}
+
+	type args struct {
+		host string
+	}
+
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		wantErr bool
+		want    uint64
+	}{
+		{
+			name: "TimeOut",
+			fields: fields{
+				metaServers: []string{"127.0.0.1:8092"},
+				cacheData: &meta2.Data{
+					QueryIDInit: map[meta2.SQLHost]uint64{},
+				},
+				logger: logger.NewLogger(errno.ModuleMetaClient),
+			},
+			args:    args{host: "127.0.0.1:8086"},
+			wantErr: true,
+			want:    0,
+		},
+		{
+			name: "DuplicateRegistration",
+			fields: fields{
+				metaServers: []string{"127.0.0.1:8092"},
+				cacheData: &meta2.Data{
+					QueryIDInit: map[meta2.SQLHost]uint64{"127.0.0.1:8086": 100000},
+				},
+				logger: logger.NewLogger(errno.ModuleMetaClient),
+			},
+			args:    args{"127.0.0.1:8086"},
+			wantErr: false,
+			want:    100000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{
+				metaServers: tt.fields.metaServers,
+				cacheData:   tt.fields.cacheData,
+				logger:      tt.fields.logger,
+			}
+
+			offset, err := c.RetryRegisterQueryIDOffset(tt.args.host)
+			if tt.wantErr {
+				require.EqualError(t, err, "register query id offset timeout")
+			}
+			require.Equal(t, offset, tt.want)
+		})
 	}
 }

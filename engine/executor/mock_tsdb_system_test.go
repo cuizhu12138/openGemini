@@ -444,12 +444,22 @@ func (mock *MockShardGroup) MapTypeBatch(m *influxql.Measurement, fields map[str
 	return nil
 }
 
+var createPlanErr, inSubQuery bool
+
 func (mock *MockShardGroup) CreateLogicalPlan(
 	ctx context.Context,
 	sources influxql.Sources,
 	schema hybridqp.Catalog) (hybridqp.QueryNode, error) {
-	builder := executor.NewLogicalPlanBuilderImpl(schema)
+	if createPlanErr {
+		if _, ok := schema.Refs()["\"name\""]; ok && inSubQuery {
+			return nil, fmt.Errorf("CreateLogicalPlan failed")
+		}
+		if _, ok := schema.Refs()["id"]; ok {
+			return nil, fmt.Errorf("CreateLogicalPlan failed")
+		}
+	}
 
+	builder := executor.NewLogicalPlanBuilderImpl(schema)
 	builder.Series()
 	builder.Exchange(executor.SERIES_EXCHANGE, nil)
 	builder.Reader(config.TSSTORE)
@@ -457,6 +467,7 @@ func (mock *MockShardGroup) CreateLogicalPlan(
 	builder.Exchange(executor.SINGLE_SHARD_EXCHANGE, nil)
 	return builder.Build()
 }
+
 func (mock *MockShardGroup) GetETraits(ctx context.Context, sources influxql.Sources, schema hybridqp.Catalog) ([]hybridqp.Trait, error) {
 	return nil, nil
 }
@@ -475,6 +486,10 @@ func (mock *MockShardGroup) LogicalPlanCost(source *influxql.Measurement, opt qr
 
 func (mock *MockShardGroup) AddShard(table *Table) {
 	mock.shards[table.Name()] = table
+}
+
+func (mock *MockShardGroup) GetSeriesKey() []byte {
+	return nil
 }
 
 func NewMockShardGroup() *MockShardGroup {
@@ -643,10 +658,6 @@ func (mock *MockShardMapper) MapShards(
 }
 
 func (mock *MockShardMapper) Close() error {
-	return nil
-}
-
-func (mock *MockShardMapper) GetSeriesKey() []byte {
 	return nil
 }
 
@@ -911,7 +922,6 @@ func (s *TSDBSystem) ExecSQL(sql string,
 		NodeID:          0,
 		InnerChunkSize:  1024,
 		Quiet:           true,
-		Traceid:         1,
 	}
 
 	stmt := query.Statements[0]
@@ -936,7 +946,6 @@ func (s *TSDBSystem) ExecSQL(sql string,
 		QueryLimitEn:            opts.QueryLimitEn,
 		RowsChan:                opts.RowsChan,
 		ChunkSize:               opts.InnerChunkSize,
-		Traceid:                 opts.Traceid,
 		AbortChan:               opts.AbortCh,
 	}
 

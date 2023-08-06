@@ -71,15 +71,18 @@ var messageMap = map[Errno]*Message{
 	WriteMapMetaShardInfo:           newWarnMessage("can't map meta.ShardInfo", ModuleWrite),
 	WritePointOutOfRP:               newWarnMessage("point time is expired, compared with rp duration", ModuleWrite),
 
-	ErrUnmarshalPoints:     newWarnMessage("unmarshal points error, err: %s", ModuleWrite),
-	ErrWriteReadonly:       newWarnMessage("this node is readonly status", ModuleWrite),
-	ParseFieldTypeConflict: newWarnMessage("conflict field type: %s", ModuleWrite),
-	EngineClosed:           newWarnMessage("engine is closed", ModuleWrite),
-	WriteMissTagValue:      newWarnMessage("missing tag value for %q", ModuleWrite),
-	ErrorTagArrayFormat:    newWarnMessage("error tag array format", ModuleWrite),
-	WriteErrorArray:        newWarnMessage("error tag array", ModuleWrite),
-	TooManyTagKeys:         newWarnMessage("too many tag keys", ModuleWrite),
-	SeriesLimited:          newWarnMessage("too many series in database %s. upper limit: %d; current: %d", ModuleWrite),
+	ErrUnmarshalPoints:      newWarnMessage("unmarshal points error, err: %s", ModuleWrite),
+	ErrWriteReadonly:        newWarnMessage("this node is readonly status", ModuleWrite),
+	ParseFieldTypeConflict:  newWarnMessage("conflict field type: %s", ModuleWrite),
+	EngineClosed:            newWarnMessage("engine is closed", ModuleWrite),
+	WriteMissTagValue:       newWarnMessage("missing tag value for %q", ModuleWrite),
+	ErrorTagArrayFormat:     newWarnMessage("error tag array format", ModuleWrite),
+	WriteErrorArray:         newWarnMessage("error tag array", ModuleWrite),
+	TooManyTagKeys:          newWarnMessage("too many tag keys", ModuleWrite),
+	SeriesLimited:           newWarnMessage("too many series in database %s. upper limit: %d; current: %d", ModuleWrite),
+	RecordWriterFatalErr:    newFatalMessage("record writer raise fatal error", ModuleWrite),
+	ArrowRecordTimeFieldErr: newFatalMessage("the time field of arrow record should the last column", ModuleWrite),
+	ArrowFlightGetRoleErr:   newFatalMessage("arrow flight only support the ts-server or ts-data", ModuleWrite),
 
 	// network module error codes
 	NoConnectionAvailable: newFatalMessage("no connections available, node: %v, %v", ModuleNetwork),
@@ -132,6 +135,8 @@ var messageMap = map[Errno]*Message{
 	NoColValToColumnFunc:         newWarnMessage("no func to transform colval into column: %s", ModuleQueryEngine),
 	InvalidQuerySchema:           newWarnMessage("invalid query schema", ModuleQueryEngine),
 	InvalidQueryStat:             newWarnMessage("invalid query stat", ModuleQueryEngine),
+	ErrQueryNotFound:             newWarnMessage("no such query id: %d", ModuleQueryEngine),
+	ErrQueryKilled:               newWarnMessage("query(%d) killed", ModuleQueryEngine),
 
 	// store engine error codes
 	CreateIndexFailPointRowType:        newFatalMessage("create index failed due to rows are not belong to type PointRow", ModuleIndex),
@@ -183,8 +188,10 @@ var messageMap = map[Errno]*Message{
 	UnsupportedConditionInFullJoin: newWarnMessage("unsupported condition in full join", ModuleQueryEngine),
 	UnsupportedHoltWinterInit:      newWarnMessage("unsupported holt_winters init", ModuleQueryEngine),
 	BucketLacks:                    newWarnMessage("get resources out of time: bucket lacks of resources", ModuleQueryEngine),
+	DirectBucketLacks:              newWarnMessage("get resources out of time: no wait bucket lacks of resources", ModuleQueryEngine),
 	SortTransformRunningErr:        newWarnMessage("SortTransform run error", ModuleQueryEngine),
 	HashMergeTransformRunningErr:   newWarnMessage("HashMergeTransform run error", ModuleQueryEngine),
+	HashAggTransformRunningErr:     newWarnMessage("HashAggTransform work error", ModuleQueryEngine),
 
 	// meta error codes
 	InvalidTagKey:          newWarnMessage(`tag key can't be '%s'`, ModuleMeta),
@@ -251,7 +258,7 @@ var messageMap = map[Errno]*Message{
 
 	// index error codes
 	ConvertToBinaryExprFailed:  newWarnMessage("convert to BinaryExpr failed: expr %T is not *influxql.BinaryExpr", ModuleIndex),
-	ErrQuerySeriesUpperBound:   newNoticeMessage("trigger query series upper bound error", ModuleIndex),
+	ErrQuerySeriesUpperBound:   newNoticeMessage("max-select-series limit exceeded: %d/%d", ModuleIndex),
 	ErrTooSmallKeyCount:        newNoticeMessage("too small key count error", ModuleIndex),
 	ErrTooSmallIndexKey:        newNoticeMessage("too small index key error", ModuleIndex),
 	ErrGetNonExistingMark:      newFatalMessage("trying to get non existing mark %d, while size is %d", ModuleIndex),
@@ -263,6 +270,7 @@ var messageMap = map[Errno]*Message{
 	ErrRPNIsNullForAnd:         newFatalMessage("rpn stack should not be null for AND", ModuleIndex),
 	ErrRPNIsNullForOR:          newFatalMessage("rpn stack should not be null for OR", ModuleIndex),
 	ErrCoarseIndexFragment:     newFatalMessage("property coarse_index_fragment should be greater than 1", ModuleIndex),
+	ErrQuerySchemaUpperBound:   newNoticeMessage("max-select-schema limit exceeded: %d/%d", ModuleQueryEngine),
 
 	// monitoring and statistics
 	WatchFileTimeout: newWarnMessage("watch file timeout", ModuleStat),

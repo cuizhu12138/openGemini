@@ -98,18 +98,20 @@ func deal_Fill (fill interface{})  (FillOption , interface{},bool) {
     fieldOptions        []*fieldList
     indexOptions        []*IndexOption
     indexOption         *IndexOption
+    databasePolicy      DatabasePolicy
 }
 
 %token <str>    FROM MEASUREMENT INTO ON SELECT WHERE AS GROUP BY ORDER LIMIT OFFSET SLIMIT SOFFSET SHOW CREATE FULL PRIVILEGES OUTER JOIN
                 TO IN NOT EXISTS REVOKE FILL DELETE WITH ENGINETYPE ALL PASSWORD NAME REPLICANUM ALTER USER USERS
                 DATABASES DATABASE MEASUREMENTS RETENTION POLICIES POLICY DURATION DEFAULT SHARD INDEX GRANT HOT WARM TYPE SET FOR GRANTS
                 REPLICATION SERIES DROP CASE WHEN THEN ELSE BEGIN END TRUE FALSE TAG ATTRIBUTE FIELD KEYS VALUES KEY EXPLAIN ANALYZE EXACT CARDINALITY SHARDKEY
-                PRIMARYKEY SORTKEY PROPERTY 
-                CONTINUOUS DIAGNOSTICS QUERIES QUERIE SHARDS STATS SUBSCRIPTIONS SUBSCRIPTION GROUPS INDEXTYPE INDEXLIST SEGMENT
+                PRIMARYKEY SORTKEY PROPERTY
+                CONTINUOUS DIAGNOSTICS QUERIES QUERIE SHARDS STATS SUBSCRIPTIONS SUBSCRIPTION GROUPS INDEXTYPE INDEXLIST SEGMENT KILL
                 EVERY RESAMPLE
                 DOWNSAMPLE DOWNSAMPLES SAMPLEINTERVAL TIMEINTERVAL STREAM DELAY STREAMS
                 QUERY PARTITION
                 TOKEN TOKENIZERS MATCH LIKE MATCHPHRASE
+                REPLICAS DETAIL
 %token <bool>   DESC ASC
 %token <str>    COMMA SEMICOLON LPAREN RPAREN REGEX
 %token <int>    EQ NEQ LT LTE GT GTE DOT DOUBLECOLON NEQREGEX EQREGEX
@@ -140,13 +142,14 @@ func deal_Fill (fill interface{})  (FillOption , interface{},bool) {
                                     CREATE_CONTINUOUS_QUERY_STATEMENT SHOW_CONTINUOUS_QUERIES_STATEMENT DROP_CONTINUOUS_QUERY_STATEMENT
                                     CREATE_DOWNSAMPLE_STATEMENT DOWNSAMPLE_INTERVALS DROP_DOWNSAMPLE_STATEMENT SHOW_DOWNSAMPLE_STATEMENT
                                     CREATE_STREAM_STATEMENT SHOW_STREAM_STATEMENT DROP_STREAM_STATEMENT COLUMN_LISTS SHOW_MEASUREMENT_KEYS_STATEMENT
+                                    SHOW_QUERIES_STATEMENT KILL_QUERY_STATEMENT
 %type <fields>                      COLUMN_CLAUSES IDENTS
 %type <field>                       COLUMN_CLAUSE
 %type <stmts>                       ALL_QUERIES ALL_QUERY
 %type <sources>                     FROM_CLAUSE TABLE_NAMES SUBQUERY_CLAUSE INTO_CLAUSE
 %type <source>                      JOIN_CLAUSE
 %type <ment>                        TABLE_OPTION  TABLE_NAME_WITH_OPTION TABLE_CASE MEASUREMENT_WITH
-%type <expr>                        WHERE_CLAUSE CONDITION OPERATION_EQUAL COLUMN_VAREF COLUMN CONDITION_COLUMN TAG_KEYS
+%type <expr>                        WHERE_CLAUSE OR_CONDITION AND_CONDITION CONDITION OPERATION_EQUAL COLUMN_VAREF COLUMN CONDITION_COLUMN TAG_KEYS
 				    CASE_WHEN_CASE CASE_WHEN_CASES  FIELD_FILL_POLICY
 %type <int>                         CONDITION_OPERATOR
 %type <int64>                       SEGMENT_NUM
@@ -172,6 +175,7 @@ func deal_Fill (fill interface{})  (FillOption , interface{},bool) {
 %type <fieldOptions>                FIELD_OPTIONS
 %type <indexOptions>                INDEX_OPTIONS
 %type <indexOption>                 INDEX_OPTION
+%type <databasePolicy>              DATABASE_POLICY
 %%
 
 ALL_QUERIES:
@@ -385,6 +389,14 @@ STATEMENT:
     |SHOW_MEASUREMENT_KEYS_STATEMENT
     {
         $$ = $1
+    }
+    |SHOW_QUERIES_STATEMENT
+    {
+    	$$ = $1
+    }
+    |KILL_QUERY_STATEMENT
+    {
+    	$$ = $1
     }
 
 SELECT_STATEMENT:
@@ -909,8 +921,28 @@ WHERE_CLAUSE:
         $$ = nil
     }
 
-CONDITION:
+AND_CONDITION:
     OPERATION_EQUAL
+    {
+        $$ = $1
+    }
+    |CONDITION AND CONDITION
+    {
+         $$ = &BinaryExpr{Op:Token($2),LHS:$1,RHS:$3}
+    }
+
+OR_CONDITION:
+    AND_CONDITION
+    {
+        $$ = $1
+    }
+    |CONDITION OR CONDITION
+    {
+        $$ = &BinaryExpr{Op:Token($2),LHS:$1,RHS:$3}
+    }
+
+CONDITION:
+    OR_CONDITION
     {
         $$ = $1
     }
@@ -918,21 +950,23 @@ CONDITION:
     {
     	$$ = &ParenExpr{Expr:$2}
     }
-    |CONDITION AND CONDITION
+    |IDENT IN LPAREN COLUMN_CLAUSES RPAREN
     {
-        $$ = &BinaryExpr{Op:Token($2),LHS:$1,RHS:$3}
-    }
-    |CONDITION OR CONDITION
-    {
-        $$ = &BinaryExpr{Op:Token($2),LHS:$1,RHS:$3}
-    }
-    |IDENT IN LPAREN IDENTS RPAREN
-    {
-    	$$ = &BinaryExpr{}
+        ident := &VarRef{Val:$1}
+    	var expr,e Expr
+    	for i := range $4{
+    	    expr = &BinaryExpr{LHS:ident, Op:Token(EQ), RHS:$4[i].Expr}
+    	    if e == nil{
+    	        e = expr
+    	    }else{
+    	        e = &BinaryExpr{LHS:e, Op:Token(OR), RHS:expr}
+    	    }
+    	}
+    	$$ = e
     }
     |IDENT IN LPAREN SELECT_STATEMENT RPAREN
     {
-    	$$ = &BinaryExpr{}
+    	$$ = &InCondition{Stmt:$4.(*SelectStatement), Column: &VarRef{Val: $1}}
     }
     |EXISTS LPAREN SELECT_STATEMENT RPAREN
     {
@@ -1205,25 +1239,54 @@ SLIMIT_SOFFSET_OPTION:
 SHOW_DATABASES_STATEMENT:
     SHOW DATABASES
     {
-        $$ = &ShowDatabasesStatement{}
+        $$ = &ShowDatabasesStatement{ShowDetail:false}
+    }
+    |SHOW DATABASES DETAIL
+    {
+        $$ = &ShowDatabasesStatement{ShowDetail:true}
     }
 
 CREATE_DATABASE_STATEMENT:
-    CREATE DATABASE IDENT WITH_CLAUSES ALLOW_TAG_ARRAY
+    CREATE DATABASE IDENT WITH_CLAUSES DATABASE_POLICY
     {
         sms := $4
 
         sms.(*CreateDatabaseStatement).Name = $3
-        sms.(*CreateDatabaseStatement).EnableTagArray = $5
+        sms.(*CreateDatabaseStatement).DatabaseAttr = $5
         $$ = sms
     }
-    |CREATE DATABASE IDENT ALLOW_TAG_ARRAY
+    |CREATE DATABASE IDENT DATABASE_POLICY
     {
         stmt := &CreateDatabaseStatement{}
         stmt.RetentionPolicyCreate = false
         stmt.Name = $3
-        stmt.EnableTagArray = $4
+        stmt.DatabaseAttr = $4
         $$ = stmt
+    }
+
+DATABASE_POLICY:
+    REPLICAS INTEGER
+    {
+        $$ = DatabasePolicy{Replicas:uint32($2), EnableTagArray:false}
+    }
+    |
+    ALLOW_TAG_ARRAY
+    {
+        $$ = DatabasePolicy{EnableTagArray:$1}
+    }
+    |
+    REPLICAS INTEGER ALLOW_TAG_ARRAY
+    {
+        $$ = DatabasePolicy{Replicas:uint32($2), EnableTagArray:$3}
+    }
+    |
+    ALLOW_TAG_ARRAY REPLICAS INTEGER
+    {
+        $$ = DatabasePolicy{Replicas:uint32($3), EnableTagArray:$1}
+    }
+    |
+    {
+        $$ = DatabasePolicy{EnableTagArray:false}
     }
 
 ALLOW_TAG_ARRAY:
@@ -1238,10 +1301,7 @@ ALLOW_TAG_ARRAY:
     {
         $$ = false
     }
-    |
-    {
-        $$ = false
-    }
+
 
 WITH_CLAUSES:
     WITH CREAT_DATABASE_POLICYS
@@ -2969,5 +3029,14 @@ DROP_STREAM_STATEMENT:
     {
     	$$ = &DropStreamsStatement{Name: $3}
     }
-
+SHOW_QUERIES_STATEMENT:
+    SHOW QUERIES
+    {
+        $$ = &ShowQueriesStatement{}
+    }
+KILL_QUERY_STATEMENT:
+    KILL QUERY INTEGER
+    {
+        $$ = &KillQueryStatement{QueryID: uint64($3)}
+    }
 %%

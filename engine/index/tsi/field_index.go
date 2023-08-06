@@ -19,6 +19,7 @@ package tsi
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"sync"
 	"unsafe"
@@ -62,7 +63,7 @@ func NewFieldIndex(opts *Options) (*fieldIndex, error) {
 }
 
 func (idx *fieldIndex) Open() error {
-	path := idx.path + "/" + FieldIndexDirName
+	path := filepath.Join(idx.path, FieldIndexDirName)
 	tb, err := mergeset.OpenTable(path, nil, nil, idx.lock)
 	if err != nil {
 		return fmt.Errorf("cannot open index:%s, err: %+v", path, err)
@@ -108,6 +109,7 @@ func (idx *fieldIndex) putIndexSearch(is *indexSearch) {
 	is.kb.Reset()
 	is.ts.MustClose()
 	is.mp.Reset()
+	is.vrp.Reset()
 	is.idx = nil
 	indexSearchPool.Put(is)
 }

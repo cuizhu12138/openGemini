@@ -26,8 +26,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openGemini/openGemini/engine"
 	"github.com/openGemini/openGemini/engine/executor"
 	"github.com/openGemini/openGemini/engine/executor/spdy"
+	"github.com/openGemini/openGemini/engine/executor/spdy/transport"
 	"github.com/openGemini/openGemini/engine/hybridqp"
 	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/memory"
@@ -219,7 +221,7 @@ func TestMultiPipelineExecutors_MemSize(t *testing.T) {
 		executor.GetPipelineExecutorResourceManager().SetManagerParas(mem, time.Second)
 	}()
 	executor.GetPipelineExecutorResourceManager().Reset()
-	executor.GetPipelineExecutorResourceManager().SetManagerParas(30000, time.Second)
+	executor.GetPipelineExecutorResourceManager().SetManagerParas(30000*100, time.Second)
 	var wg sync.WaitGroup
 	SimpleMergeDAG = func() {
 		defer wg.Done()
@@ -250,7 +252,7 @@ func TestMultiPipelineExecutors_ALLTimeout(t *testing.T) {
 		defer wg.Done()
 		executor := PipelineExecutorGen()
 		if e := executor.ExecuteExecutor(context.Background()); e != nil {
-			if !assert.Equal(t, e.Error(), errno.NewError(errno.BucketLacks).Error()) {
+			if !assert.Equal(t, e.Error(), errno.NewError(errno.DirectBucketLacks).Error()) {
 				t.Errorf(e.Error())
 			}
 		}
@@ -665,5 +667,78 @@ func TestNewSparseIndexScanExecutorBuilder(t *testing.T) {
 	b.SetInfo(info_clone)
 	if _, err := b.Build(node); err != nil {
 		assert.Equal(t, err, errno.NewError(errno.LogicalPlanBuildFail, "missing  spdy.Responser in node exchange produce"))
+	}
+}
+
+func TestOneShardExchangeExecutorBuilder(t *testing.T) {
+	m := make(map[uint64][][]interface{})
+	m[1] = nil
+	w := &transport.Responser{}
+	traits := executor.NewStoreExchangeTraits(w, m)
+	opt := query.ProcessorOptions{
+		Interval: hybridqp.Interval{
+			Duration: 10 * time.Nanosecond,
+		},
+		Dimensions:            []string{"host"},
+		Ascending:             true,
+		ChunkSize:             100,
+		EnableBinaryTreeMerge: 0,
+	}
+	req := &executor.RemoteQuery{
+		Opt:      opt,
+		ShardIDs: []uint64{1},
+	}
+	info := &executor.IndexScanExtraInfo{
+		ShardID: uint64(10),
+		Req:     req,
+	}
+	b := executor.NewScannerStoreExecutorBuilder(traits, nil, req, nil, 2)
+	if b == nil {
+		panic("nil StoreExecutorBuilder")
+	}
+	b.SetInfo(info)
+	schema := executor.NewQuerySchema(nil, nil, &opt, nil)
+
+	series := executor.NewLogicalSeries(schema)
+	indexscan := executor.NewLogicalIndexScan(series, schema)
+	shardExchange := executor.NewLogicalExchange(indexscan, executor.SHARD_EXCHANGE, nil, schema)
+	agg := executor.NewLogicalAggregate(shardExchange, schema)
+	nodeExchange := executor.NewLogicalExchange(agg, executor.NODE_EXCHANGE, nil, schema)
+	nodeExchange.ToProducer()
+	p, _ := b.Build(nodeExchange)
+	if len(p.(*executor.PipelineExecutor).GetProcessors()) != 2 {
+		t.Error("OneShardExchangeExecutorBuilder test error")
+	}
+}
+
+func TestOneReaderExchangeExecutorBuilder(t *testing.T) {
+	mapShardsToReaders := make(map[uint64][][]interface{})
+	mapShardsToReaders[1] = [][]interface{}{make([]interface{}, 0)}
+	traits := executor.NewStoreExchangeTraits(nil, mapShardsToReaders)
+
+	opt := query.ProcessorOptions{
+		Interval: hybridqp.Interval{
+			Duration: 10 * time.Nanosecond,
+		},
+		Dimensions:            []string{"host"},
+		Ascending:             true,
+		ChunkSize:             100,
+		EnableBinaryTreeMerge: 0,
+	}
+	b := executor.NewIndexScanExecutorBuilder(traits, 0)
+	if b == nil {
+		panic("nil IndexScanExecutorBuilder")
+	}
+	schema := executor.NewQuerySchema(nil, nil, &opt, nil)
+
+	series := executor.NewLogicalSeries(schema)
+	reader := executor.NewLogicalReader(series, schema)
+	agg1 := executor.NewLogicalAggregate(reader, schema)
+	readerExchange := executor.NewLogicalExchange(agg1, executor.READER_EXCHANGE, nil, schema)
+	agg2 := executor.NewLogicalAggregate(readerExchange, schema)
+	executor.RegistryTransformCreator(&executor.LogicalReader{}, &engine.ChunkReader{})
+	p, _ := b.Build(agg2)
+	if len(p.(*executor.PipelineExecutor).GetProcessors()) != 2 {
+		t.Error("OneShardExchangeExecutorBuilder test error")
 	}
 }

@@ -100,6 +100,9 @@ const (
 	NoColValToColumnFunc         = 1119
 	InvalidQuerySchema           = 1120
 	InvalidQueryStat             = 1121
+	ErrQueryNotFound             = 1122
+	ErrQueryKilled               = 1123
+	DirectBucketLacks            = 1124
 )
 
 // store engine error codes
@@ -156,6 +159,7 @@ const (
 	UnsupportedHoltWinterInit      = 3004
 	SortTransformRunningErr        = 3005
 	HashMergeTransformRunningErr   = 3006
+	HashAggTransformRunningErr     = 3007
 )
 
 // meta
@@ -241,6 +245,9 @@ const (
 	WriteErrorArray            = 5018
 	TooManyTagKeys             = 5019
 	SeriesLimited              = 5020
+	RecordWriterFatalErr       = 5021
+	ArrowRecordTimeFieldErr    = 5022
+	ArrowFlightGetRoleErr      = 5023
 )
 
 // index
@@ -258,6 +265,7 @@ const (
 	ErrRPNIsNullForAnd         = 6011
 	ErrRPNIsNullForOR          = 6012
 	ErrCoarseIndexFragment     = 6013
+	ErrQuerySchemaUpperBound   = 6014
 )
 
 const (

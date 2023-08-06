@@ -25,6 +25,7 @@ import (
 	"github.com/openGemini/openGemini/engine/comm"
 	"github.com/openGemini/openGemini/engine/hybridqp"
 	"github.com/openGemini/openGemini/lib/config"
+	"github.com/openGemini/openGemini/lib/errno"
 	"github.com/openGemini/openGemini/lib/resourceallocator"
 	"github.com/openGemini/openGemini/open_src/influx/influxql"
 	"github.com/openGemini/openGemini/open_src/influx/query"
@@ -86,7 +87,6 @@ var _ = RegistryTransformCreator(&LogicalIndexScan{}, &IndexScanTransformCreator
 func (trans *IndexScanTransform) BuildPlan(downSampleLevel int) (*QuerySchema, hybridqp.QueryNode, error) {
 	schema := trans.node.Schema()
 	if downSampleLevel == 0 || !GetEnableFileCursor() || !schema.HasOptimizeAgg() || schema.HasAuxTag() {
-		trans.chunkPool = NewCircularChunkPool(CircularChunkNum, NewChunkBuilder(trans.outRowDataType))
 		return schema.(*QuerySchema), trans.node, nil
 	}
 	s := trans.BuildDownSampleSchema(schema)
@@ -317,6 +317,9 @@ func (trans *IndexScanTransform) WorkHelper(ctx context.Context) error {
 	go func() {
 		defer wgChild.Done()
 		if pipError = trans.pipelineExecutor.ExecuteExecutor(ctx); pipError != nil {
+			if errno.Equal(pipError, errno.DirectBucketLacks) {
+				output[0].Close()
+			}
 			if trans.pipelineExecutor.Aborted() {
 				return
 			}
@@ -326,7 +329,7 @@ func (trans *IndexScanTransform) WorkHelper(ctx context.Context) error {
 	trans.Running(ctx)
 	wgChild.Wait()
 	trans.wg.Wait()
-	return nil
+	return pipError
 }
 
 func (trans *IndexScanTransform) Running(ctx context.Context) {
@@ -353,8 +356,10 @@ func (trans *IndexScanTransform) RewriteChunk(c Chunk) Chunk {
 		trans.buildDownSampleRowDataType(c)
 	}
 	newChunk := trans.chunkPool.GetChunk()
-	c.CopyTo(newChunk)
-	newChunk.SetRowDataType(trans.downSampleRowDataType)
+	if c.CopyByRowDataType(newChunk, trans.downSampleRowDataType, trans.outRowDataType) != nil {
+		return nil
+	}
+	newChunk.SetRowDataType(trans.outRowDataType)
 	return newChunk
 }
 
@@ -370,7 +375,7 @@ func (trans *IndexScanTransform) buildDownSampleRowDataType(c Chunk) {
 		tempMap[trans.downSampleValue[currVal]] = indexByName[originVal]
 	}
 	trans.downSampleRowDataType.SetIndexByName(tempMap)
-	trans.chunkPool = NewCircularChunkPool(CircularChunkNum, NewChunkBuilder(trans.downSampleRowDataType))
+	trans.chunkPool = NewCircularChunkPool(CircularChunkNum, NewChunkBuilder(trans.outRowDataType))
 }
 
 func (trans *IndexScanTransform) GetOutputs() Ports {

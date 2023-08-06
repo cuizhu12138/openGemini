@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	SeriesKeyToTSIDCacheName = "seriesKey_tsid"
-	TSIDToSeriesKeyCacheName = "tsid_seriesKey"
-	TSIDToFieldCacheName     = "tsid_field"
+	SeriesKeyToTSIDCacheName  = "seriesKey_tsid"
+	TSIDToSeriesKeyCacheName  = "tsid_seriesKey"
+	TSIDToFieldCacheName      = "tsid_field"
+	TagKeyToTagValueCacheName = "tagKey_tagValue"
 )
 
 type IndexCache struct {
@@ -39,6 +40,9 @@ type IndexCache struct {
 
 	// Cache for fast TagFilters -> TSIDs lookup.
 	tagCache *workingsetcache.Cache
+
+	// Cache for TagKeys -> TagValues
+	TagKeyValueCache *workingsetcache.Cache
 
 	metrics *IndexMetrics
 
@@ -74,6 +78,18 @@ func (ic *IndexCache) GetTSIDFromTSIDCache(id *uint64, key []byte) bool {
 func (ic *IndexCache) PutTSIDToTSIDCache(id *uint64, key []byte) {
 	buf := (*[unsafe.Sizeof(*id)]byte)(unsafe.Pointer(id))[:]
 	ic.SeriesKeyToTSIDCache.Set(key, buf)
+}
+
+func (ic *IndexCache) isTagKeyExist(key []byte) bool {
+	if ic.TagKeyValueCache == nil {
+		return false
+	}
+
+	return ic.TagKeyValueCache.Has(key)
+}
+
+func (ic *IndexCache) PutTagValuesToTagKeysCache(value []byte, key []byte) {
+	ic.TagKeyValueCache.Set(key, value)
 }
 
 func (ic *IndexCache) putToSeriesKeyCache(id uint64, seriesKey []byte) {
@@ -136,9 +152,11 @@ func newIndexCache(tsidCacheSize, skeyCacheSize, tagCacheSize int, path string, 
 	if store {
 		ic.SeriesKeyToTSIDCache = LoadCache(SeriesKeyToTSIDCacheName, path, tsidCacheSize)
 		ic.TSIDToSeriesKeyCache = LoadCache(TSIDToSeriesKeyCacheName, path, skeyCacheSize)
+		ic.TagKeyValueCache = LoadCache(TagKeyToTagValueCacheName, path, defaultTagCacheSize)
 	} else {
 		ic.SeriesKeyToTSIDCache = workingsetcache.New(tsidCacheSize, time.Hour)
 		ic.TSIDToSeriesKeyCache = workingsetcache.New(skeyCacheSize, time.Hour)
+		ic.TagKeyValueCache = workingsetcache.New(skeyCacheSize, time.Hour)
 	}
 	return ic
 }

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"runtime"
 	"strings"
 	"time"
 
@@ -30,7 +29,6 @@ import (
 	"github.com/openGemini/openGemini/engine/executor"
 	"github.com/openGemini/openGemini/engine/executor/spdy/transport"
 	"github.com/openGemini/openGemini/lib/config"
-	"github.com/openGemini/openGemini/lib/cpu"
 	"github.com/openGemini/openGemini/lib/errno"
 	Logger "github.com/openGemini/openGemini/lib/logger"
 	"github.com/openGemini/openGemini/lib/machine"
@@ -43,9 +41,10 @@ import (
 	coordinator2 "github.com/openGemini/openGemini/open_src/influx/coordinator"
 	"github.com/openGemini/openGemini/open_src/influx/httpd"
 	"github.com/openGemini/openGemini/open_src/influx/query"
+	"github.com/openGemini/openGemini/services"
+	"github.com/openGemini/openGemini/services/arrowflight"
 	"github.com/openGemini/openGemini/services/castor"
 	"github.com/openGemini/openGemini/services/sherlock"
-	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
@@ -53,7 +52,7 @@ import (
 // It is built using a Config and it manages the startup and shutdown of all
 // services in the proper order.
 type Server struct {
-	cmd              *cobra.Command
+	info             app.ServerInfo
 	Listener         net.Listener
 	initMetaClientFn func() error
 	MetaClient       *meta.Client
@@ -64,6 +63,9 @@ type Server struct {
 	QueryExecutor    *query.Executor
 	PointsWriter     *coordinator.PointsWriter
 	httpService      *httpd.Service
+
+	arrowFlightService *arrowflight.Service
+	RecordWriter       *coordinator.RecordWriter
 
 	// joinPeers are the metaservers specified at run time to join this server to
 	metaJoinPeers []string
@@ -86,7 +88,7 @@ func updateTLSConfig(into **tls.Config, with *tls.Config) {
 	}
 }
 
-func NewServer(conf config.Config, cmd *cobra.Command, logger *Logger.Logger) (app.Server, error) {
+func NewServer(conf config.Config, info app.ServerInfo, logger *Logger.Logger) (app.Server, error) {
 	// First grab the base tls config we will use for all clients and servers
 	c := conf.(*config.TSSql)
 	c.Corrector(c.Common.CPUNum)
@@ -105,17 +107,8 @@ func NewServer(conf config.Config, cmd *cobra.Command, logger *Logger.Logger) (a
 		metaMaxConcurrentWriteLimit = c.HTTP.MaxConcurrentWriteLimit + c.HTTP.MaxEnqueuedWriteLimit
 	}
 
-	s := &Server{
-		cmd:         cmd,
-		Logger:      logger,
-		httpService: httpd.NewService(c.HTTP),
-		MetaClient:  meta.NewClient(c.HTTP.WeakPwdPath, false, metaMaxConcurrentWriteLimit),
-
-		metaJoinPeers: c.Common.MetaJoin,
-		metaUseTLS:    false,
-		config:        c,
-	}
-	s.httpService.Handler.Version = cmd.Version
+	s := newServer(info, logger, c, metaMaxConcurrentWriteLimit)
+	s.httpService.Handler.Version = info.Version
 	s.httpService.Handler.BuildType = "OSS"
 	s.initMetaClientFn = s.initializeMetaClient
 	s.MetaClient.SetHashAlgo(c.Common.OptHashAlgo)
@@ -136,10 +129,61 @@ func NewServer(conf config.Config, cmd *cobra.Command, logger *Logger.Logger) (a
 
 	syscontrol.SysCtrl.MetaClient = s.MetaClient
 	syscontrol.SysCtrl.NetStore = store
+	// set query schema limit
+	syscontrol.SetQuerySchemaLimit(c.SelectSpec.QuerySchemaLimit)
 
+	s.initQueryExecutor(c)
+	s.httpService.Handler.ExtSysCtrl = s.TSDBStore
+
+	s.initStatisticsPusher()
+	s.httpService.Handler.StatisticsPusher = s.statisticsPusher
+	syscontrol.SetQueryParallel(int64(c.HTTP.ChunkReaderParallel))
+	syscontrol.SetTimeFilterProtection(c.HTTP.TimeFilterProtection)
+	executor.SetPipelineExecutorResourceManagerParas(int64(c.Common.MemoryLimitSize), time.Duration(c.Common.MemoryWaitTime))
+	executor.IgnoreEmptyTag = c.Common.IgnoreEmptyTag
+
+	machine.InitMachineID(c.HTTP.BindAddress)
+
+	if c.HTTP.FlightEnabled {
+		if err = s.initArrowFlightService(c); err != nil {
+			return nil, err
+		}
+	}
+
+	s.castorService = castor.NewService(c.Analysis)
+	s.sherlockService = sherlock.NewService(c.Sherlock)
+	s.sherlockService.WithLogger(s.Logger)
+	return s, nil
+}
+
+func newServer(info app.ServerInfo, logger *Logger.Logger, c *config.TSSql, metaMaxConcurrentWriteLimit int) *Server {
+	return &Server{
+		info:          info,
+		Logger:        logger,
+		httpService:   httpd.NewService(c.HTTP),
+		MetaClient:    meta.NewClient(c.HTTP.WeakPwdPath, false, metaMaxConcurrentWriteLimit),
+		metaJoinPeers: c.Common.MetaJoin,
+		metaUseTLS:    false,
+		config:        c,
+	}
+}
+
+func (s *Server) initArrowFlightService(c *config.TSSql) error {
+	if role := s.info.App; !(role == config.AppSingle || role == config.AppData) {
+		return errno.NewError(errno.ArrowFlightGetRoleErr)
+	}
+	s.arrowFlightService = arrowflight.NewService(c.HTTP)
+	s.arrowFlightService.StatisticsPusher = s.statisticsPusher
+	s.RecordWriter = coordinator.NewRecordWriter(time.Duration(c.Coordinator.ShardWriterTimeout), int(c.Meta.PtNumPerNode), c.HTTP.FlightChFactor)
+	s.RecordWriter.StorageEngine = services.GetStorageEngine()
+	return nil
+}
+
+func (s *Server) initQueryExecutor(c *config.TSSql) {
 	metaExecutor := coordinator.NewMetaExecutor()
 	metaExecutor.MetaClient = s.MetaClient
 	metaExecutor.SetTimeOut(time.Duration(c.Coordinator.MetaExecutorWriteTimeout))
+
 	s.QueryExecutor = query.NewExecutor()
 	s.QueryExecutor.StatementExecutor = &coordinator2.StatementExecutor{
 		MetaClient:  s.MetaClient,
@@ -160,35 +204,25 @@ func NewServer(conf config.Config, cmd *cobra.Command, logger *Logger.Logger) (a
 	s.QueryExecutor.TaskManager.QueryTimeout = time.Duration(c.Coordinator.QueryTimeout)
 	s.QueryExecutor.TaskManager.LogQueriesAfter = time.Duration(c.Coordinator.LogQueriesAfter)
 	s.QueryExecutor.TaskManager.MaxConcurrentQueries = c.Coordinator.MaxConcurrentQueries
+	s.QueryExecutor.TaskManager.Register = s.MetaClient
+	s.QueryExecutor.TaskManager.Host = config.CombineDomain(c.HTTP.Domain, c.HTTP.BindAddress)
+
 	s.httpService.Handler.QueryExecutor = s.QueryExecutor
-	s.httpService.Handler.ExtSysCtrl = s.TSDBStore
-
-	s.initStatisticsPusher()
-	s.httpService.Handler.StatisticsPusher = s.statisticsPusher
-	syscontrol.SetQueryParallel(int64(c.HTTP.ChunkReaderParallel))
-	syscontrol.SetTimeFilterProtection(c.HTTP.TimeFilterProtection)
-	executor.SetPipelineExecutorResourceManagerParas(int64(c.Common.MemoryLimitSize), time.Duration(c.Common.MemoryWaitTime))
-	executor.IgnoreEmptyTag = c.Common.IgnoreEmptyTag
-
-	machine.InitMachineID(c.HTTP.BindAddress)
-
-	s.castorService = castor.NewService(c.Analysis)
-	s.sherlockService = sherlock.NewService(c.Sherlock)
-	s.sherlockService.WithLogger(s.Logger)
-	return s, nil
 }
 
 func openServer(c *config.TSSql, logger *Logger.Logger) {
 	if !c.HTTP.PprofEnabled {
 		return
 	}
-	strs := strings.Split(c.HTTP.BindAddress, ":")
-	if len(strs) != 2 {
+	port, _, err := net.SplitHostPort(c.HTTP.BindAddress)
+	if err != nil {
+		logger.Error("failed to split host and port", zap.Error(err),
+			zap.String("addr", c.HTTP.BindAddress))
 		return
 	}
-	listenIp := strs[0]
-	addr := fmt.Sprintf("%s:6061", listenIp)
-	err := http.ListenAndServe(addr, nil)
+
+	addr := net.JoinHostPort(port, "6061")
+	err = http.ListenAndServe(addr, nil)
 	if err != nil {
 		logger.Error("failed to start http server", zap.String("addr", addr))
 	}
@@ -196,16 +230,7 @@ func openServer(c *config.TSSql, logger *Logger.Logger) {
 
 func (s *Server) Open() error {
 	// Mark start-up in log.
-	s.Logger.Info("TSSQL starting",
-		zap.String("version", s.cmd.Version),
-		zap.String("branch", s.cmd.ValidArgs[0]),
-		zap.String("commit", s.cmd.ValidArgs[1]),
-		zap.String("buildTime", s.cmd.ValidArgs[2]))
-	s.Logger.Info("Go runtime",
-		zap.String("version", runtime.Version()),
-		zap.Int("maxprocs", cpu.GetCpuNum()))
-	//Mark start-up in extra log
-	fmt.Printf("%v TSSQL starting\n", time.Now())
+	app.LogStarting("TSSQL", &s.info)
 
 	// if the ForceBroadcastQuery with config is true, then the ForceBroadcastQuery in memory set to 1
 	if s.config.Coordinator.ForceBroadcastQuery {
@@ -232,6 +257,22 @@ func (s *Server) Open() error {
 	if s.sherlockService != nil {
 		s.sherlockService.Open()
 	}
+
+	if s.config.HTTP.FlightEnabled {
+		if role := s.info.App; !(role == config.AppSingle || role == config.AppData) {
+			return errno.NewError(errno.ArrowFlightGetRoleErr)
+		}
+		s.RecordWriter.MetaClient = s.MetaClient
+		if err := s.RecordWriter.Open(); err != nil {
+			return err
+		}
+
+		s.arrowFlightService.MetaClient = s.MetaClient
+		s.arrowFlightService.RecordWriter = s.RecordWriter
+		if err := s.arrowFlightService.Open(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -247,6 +288,14 @@ func (s *Server) Close() error {
 
 	if s.httpService != nil {
 		util.MustClose(s.httpService)
+	}
+
+	if s.arrowFlightService != nil {
+		util.MustClose(s.arrowFlightService)
+	}
+
+	if s.RecordWriter != nil {
+		util.MustClose(s.RecordWriter)
 	}
 
 	if s.QueryExecutor != nil {
@@ -297,21 +346,16 @@ func (s *Server) initStatisticsPusher() {
 		return
 	}
 
-	appName := "ts-sql"
-	if app.IsSingle() {
-		appName = "ts-server"
-		s.config.Monitor.SetApp(config.AppSingle)
-	}
-
 	s.statisticsPusher = statisticsPusher.NewStatisticsPusher(&s.config.Monitor, s.Logger)
 	if s.statisticsPusher == nil {
 		return
 	}
 
+	s.config.Monitor.SetApp(s.info.App)
 	hostname := config.CombineDomain(s.config.HTTP.Domain, s.config.HTTP.BindAddress)
 	globalTags := map[string]string{
 		"hostname": strings.ReplaceAll(hostname, ",", "_"),
-		"app":      appName,
+		"app":      "ts-" + string(s.info.App),
 	}
 
 	stat.InitHandlerStatistics(globalTags)

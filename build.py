@@ -2,6 +2,7 @@
 
 import sys
 import os
+import platform
 import subprocess
 from datetime import datetime
 import shutil
@@ -27,11 +28,13 @@ targets = {
     'ts-store' : './app/ts-store',
     'ts-server' : './app/ts-server',
     'ts-monitor' : './app/ts-monitor',
+    'ts-data' : './app/ts-data',
 }
 
 supported_builds = {
     'linux': [ "amd64","arm64"],
     'darwin': [ "amd64","arm64"],
+    'windows': [ "amd64","arm64"],
 }
 
 ################
@@ -127,7 +130,7 @@ def run_tests(race, parallel, timeout, no_vet, junit=False):
         logging.info("Running tests...")
         output = run(test_command)
         if "FAIL" in output:
-                    write_to_gobuild(output)
+            write_to_gobuild(output)
         logging.debug("Test output:\n%s", out.encode('ascii', 'ignore'))
     return True
 
@@ -139,10 +142,18 @@ def run(command, allow_failure=False, shell=False):
     """Run shell command (convenience wrapper around subprocess).
     """
     out = None
+
     logging.debug(command)
     try:
         if shell:
-            out = subprocess.check_output(command, stderr=subprocess.STDOUT, shell=shell)
+            if get_system_platform() != "windows":
+                out = subprocess.check_output(command, stderr=subprocess.STDOUT, shell=shell)
+            else:
+                envs = os.environ.copy()
+                env_extra = {env.split("=")[0]:env.split("=")[1] for env in command.split()[:2]}
+                envs.update(env_extra)
+                command_new = ' '.join(command.split()[2:]) # remove GOOS=windows GOARCH=arm64
+                out = subprocess.check_output(command_new, stderr=subprocess.STDOUT, shell=shell, env=envs)
         else:
             out = subprocess.check_output(command.split(), stderr=subprocess.STDOUT)
         out = out.decode('utf-8').strip()
@@ -228,7 +239,7 @@ def local_changes():
 def get_system_arch():
     """Retrieve current system architecture.
     """
-    arch = os.uname()[4]
+    arch = platform.uname()[4].lower()
     if arch == "x86_64":
         arch = "amd64"
     elif arch == "386":
@@ -245,6 +256,8 @@ def get_system_platform():
     """
     if sys.platform.startswith("linux"):
         return "linux"
+    elif sys.platform.startswith("win"):
+        return "windows"
     else:
         return sys.platform
 
@@ -265,6 +278,8 @@ def check_path_for(b):
 
     for path in os.environ["PATH"].split(os.pathsep):
         path = path.strip('"')
+        if b.upper() in path.upper():
+            return path#windows
         full_path = os.path.join(path, b)
         if os.path.isfile(full_path) and os.access(full_path, os.X_OK):
             return full_path
@@ -292,7 +307,7 @@ def check_prereqs():
     return True
 
 def build(version=None,
-          platform=None,
+          sys_platform=None,
           arch=None,
           nightly=False,
           race=False,
@@ -304,7 +319,7 @@ def build(version=None,
     """
     if tags is None:
         tags = []
-    logging.info("Starting build for %s/%s...", platform, arch)
+    logging.info("Starting build for %s/%s...", sys_platform, arch)
     logging.info("Using Go version: %s", get_go_version())
     logging.info("Using git branch: %s", get_current_branch())
     logging.info("Using git commit: %s", get_current_commit())
@@ -326,6 +341,9 @@ def build(version=None,
     logging.info("Using version '%s' for build.", version)
 
     for target, path in targets.items():
+        if sys_platform == "windows":
+            target += ".exe"
+
         logging.info("Building target: %s", target)
         build_command = ""
 
@@ -339,9 +357,9 @@ def build(version=None,
         # Handle variations in architecture output
         if arch == "i386" or arch == "i686":
             arch = "386"
-        build_command += "GOOS={} GOARCH={} ".format(platform, arch)
+        build_command += "GOOS={} GOARCH={} ".format(sys_platform, arch)
 
-        if "arm" in arch:
+        if "arm" in arch and sys_platform != "windows":
             if arch == "armel":
                 build_command += "GOARM=5 "
             elif arch == "armhf" or arch == "arm":
@@ -364,14 +382,15 @@ def build(version=None,
 
         if static:
             build_command += "-ldflags=\"-s -X main.TsVersion={} -X main.TsBranch={} -X main.TsCommit={}\" ".format(version,
-                                                                                                              get_current_branch(),
-                                                                                                              get_current_commit())
+                                                                                                                    get_current_branch(),
+                                                                                                                    get_current_commit())
         else:
             build_command += "-ldflags=\"-X main.TsVersion={} -X main.TsBranch={} -X main.TsCommit={}\" ".format(version,
-                                                                                                               get_current_branch(),
-                                                                                                               get_current_commit())
+                                                                                                                 get_current_branch(),
+                                                                                                                 get_current_commit())
         if static:
             build_command += "-a -installsuffix cgo "
+
         build_command += path
         start_time = datetime.utcnow()
         logging.info(build_command)
@@ -384,12 +403,14 @@ def build(version=None,
 def write_to_gobuild(content):
     logging.info("write to file")
 
-    flags = os.O_WRONLY | os.O_CREAT
-    modes = stat.S_IWUSR | stat.S_IRUSR
-    with os.fdopen(os.open(gobuild_out, flags, modes), 'w', encoding="utf-8") as f:
-        f.write("error\n")
-        f.write(content)
-
+    if get_system_platform() != "windows":
+        with open(gobuild_out, 'w') as f:
+            f.write("error\n")
+            f.write(content)
+    else:
+        with open(gobuild_out, 'w') as f:
+            f.write("error\n")
+            f.write(content.decode("utf-8"))
 
 def main(args):
     global PACKAGE_NAME
@@ -447,14 +468,14 @@ def main(args):
         single_build = False
     else:
         platforms = [args.platform]
-    for platform in platforms:
-        build_output.update( { platform : {} } )
+    for plf in platforms:
+        build_output.update( { plf : {} } )
         archs = []
         if args.arch == "all":
             single_build = False
-            archs = supported_builds.get(platform)
+            archs = supported_builds.get(plf)
         else:
-            if args.arch not in supported_builds.get(platform):
+            if args.arch not in supported_builds.get(plf):
                 logging.error("Invalid build arch: %s", args.arch)
                 return 1
             archs = [args.arch]
@@ -462,9 +483,9 @@ def main(args):
         for arch in archs:
             od = args.outdir
             if not single_build:
-                od = os.path.join(args.outdir, platform, arch)
+                od = os.path.join(args.outdir, plf, arch)
             if not build(version=args.version,
-                         platform=platform,
+                         sys_platform=plf,
                          arch=arch,
                          nightly=args.nightly,
                          race=args.race,
@@ -473,7 +494,7 @@ def main(args):
                          tags=args.build_tags,
                          static=args.static):
                 return 1
-            build_output.get(platform).update( { arch : od } )
+            build_output.get(plf).update( { arch : od } )
 
     if orig_branch != get_current_branch():
         logging.info("Moving back to original git branch: %s", orig_branch)

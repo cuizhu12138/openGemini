@@ -44,14 +44,14 @@ import (
 	"github.com/openGemini/openGemini/lib/syscontrol"
 	"github.com/openGemini/openGemini/open_src/github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/openGemini/openGemini/open_src/github.com/hashicorp/serf/serf"
+	"github.com/openGemini/openGemini/services"
 	"github.com/openGemini/openGemini/services/sherlock"
 	stream2 "github.com/openGemini/openGemini/services/stream"
-	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
 
 type Server struct {
-	cmd *cobra.Command
+	info app.ServerInfo
 
 	err chan error
 
@@ -77,9 +77,9 @@ type Server struct {
 }
 
 // NewServer returns a new instance of Server built from a config.
-func NewServer(c config.Config, cmd *cobra.Command, logger *Logger.Logger) (app.Server, error) {
+func NewServer(c config.Config, info app.ServerInfo, logger *Logger.Logger) (app.Server, error) {
 	s := &Server{
-		cmd:    cmd,
+		info:   info,
 		Logger: logger,
 	}
 
@@ -92,13 +92,15 @@ func NewServer(c config.Config, cmd *cobra.Command, logger *Logger.Logger) (app.
 	mutable.SetSizeLimit(int64(conf.Data.ShardMutableSizeLimit))
 	mutable.InitConcurLimiter(cpu.GetCpuNum())
 	mutable.InitMutablePool(cpu.GetCpuNum())
+	mutable.InitWriteRecPool(cpu.GetCpuNum())
 	immutable.InitWriterPool(3 * cpu.GetCpuNum())
 
 	s.config = conf
 	Logger.SetLogger(Logger.GetLogger().With(zap.String("hostname", conf.Data.IngesterAddress)))
 
 	// set query series limit
-	syscontrol.SetQuerySeriesLimit(conf.Data.QuerySeriesLimit)
+	syscontrol.SetQuerySeriesLimit(conf.SelectSpec.QuerySeriesLimit)
+	syscontrol.SetQueryEnabledWhenExceedSeries(conf.SelectSpec.EnableWhenExceed)
 
 	s.storageDataPath = conf.Data.DataDir
 	s.metaPath = conf.Data.MetaDir
@@ -138,16 +140,7 @@ func (s *Server) Err() <-chan error { return s.err }
 // Open opens the meta and data store and all services.
 func (s *Server) Open() error {
 	// Mark start-up in log.
-	s.Logger.Info("TSStore starting",
-		zap.String("version", s.cmd.Version),
-		zap.String("branch", s.cmd.ValidArgs[0]),
-		zap.String("commit", s.cmd.ValidArgs[1]),
-		zap.String("buildTime", s.cmd.ValidArgs[2]))
-	s.Logger.Info("Go runtime",
-		zap.String("version", runtime.Version()),
-		zap.Int("maxprocs", cpu.GetCpuNum()))
-	//Mark start-up in extra log
-	_, _ = fmt.Fprintf(os.Stdout, "%v TSStore starting\n", time.Now())
+	app.LogStarting("TSStore", &s.info)
 
 	s.transServer = transport.NewServer(s.ingestAddr, s.selectAddr)
 	if err := s.transServer.Open(); err != nil {
@@ -222,6 +215,9 @@ func (s *Server) Open() error {
 		s.sherlockService.Open()
 	}
 	s.iodetector = iodetector.OpenIODetection(s.config.IODetector)
+	if role := s.info.App; s.config.HTTPD.FlightEnabled && (role == config.AppSingle || role == config.AppData) {
+		services.SetStorageEngine(s.storage)
+	}
 	return err
 }
 
@@ -267,19 +263,16 @@ func (s *Server) initStatisticsPusher() {
 	if !s.config.Monitor.StoreEnabled {
 		return
 	}
-	appName := "ts-store"
-	if app.IsSingle() {
-		appName = "ts-server"
-		s.config.Monitor.SetApp(config.AppSingle)
-	}
+
 	s.statisticsPusher = statisticsPusher.NewStatisticsPusher(&s.config.Monitor, s.Logger)
 	if s.statisticsPusher == nil {
 		return
 	}
 
+	s.config.Monitor.SetApp(s.info.App)
 	globalTags := map[string]string{
 		"hostname": strings.ReplaceAll(config.CombineDomain(s.config.Data.Domain, s.selectAddr), ",", "_"),
-		"app":      appName,
+		"app":      "ts-" + string(s.info.App),
 	}
 
 	stat.InitPerfStatistics(globalTags)

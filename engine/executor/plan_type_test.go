@@ -231,6 +231,22 @@ func NewMultiSourceSchema() hybridqp.Catalog {
 	return schema
 }
 
+func NewFullSeriesHintSchema() hybridqp.Catalog {
+	fields := []*influxql.Field{
+		{
+			Expr: &influxql.VarRef{
+				Val:  "value",
+				Type: influxql.Integer,
+			},
+		},
+	}
+	opt := query.ProcessorOptions{
+		HintType: hybridqp.FullSeriesQuery,
+	}
+	schema := executor.NewQuerySchema(fields, []string{"value"}, &opt, nil)
+	return schema
+}
+
 func TestUnCachedPlanType(t *testing.T) {
 	schema := []hybridqp.Catalog{NewHintSchema(), NewHoltWinterSchema(), NewAggGroupSchema(), NewAggGroupLimitSchema(),
 		NewAggGroupSchema(), NewMultiSourceSchema()}
@@ -239,6 +255,17 @@ func TestUnCachedPlanType(t *testing.T) {
 	for i, s := range schema {
 		planType := executor.NormalGetPlanType(s, stmt[i])
 		if planType != executor.UNKNOWN {
+			t.Errorf("error plan type")
+		}
+	}
+}
+
+func TestCachedPlanType(t *testing.T) {
+	schema := []hybridqp.Catalog{NewFullSeriesHintSchema()}
+	stmt := []*influxql.SelectStatement{nil}
+	for i, s := range schema {
+		planType := executor.NormalGetPlanType(s, stmt[i])
+		if planType == executor.UNKNOWN {
 			t.Errorf("error plan type")
 		}
 	}
@@ -282,6 +309,9 @@ func TestPlanTypeShard(t *testing.T) {
 	}
 	if _, err := init.LogicalPlanCost(nil, query.ProcessorOptions{}); err != nil {
 		t.Error("planTypeShard cost error")
+	}
+	if init.GetSeriesKey() != nil {
+		t.Error("planTypeShard getSeriesKey error")
 	}
 	initMapper := executor.NewPlanTypeInitShardMapper()
 	if initMapper.Close() != nil {

@@ -203,8 +203,8 @@ func Test_Data_ReSharding(t *testing.T) {
 	}
 
 	ptinfo := data.PtView["foo"]
-	dbptInfo := []PtInfo{{PtOwner{1}, Offline, 0, 1},
-		{PtOwner{2}, Offline, 1, 1}}
+	dbptInfo := []PtInfo{{PtOwner{1}, Offline, 0, 1, 0},
+		{PtOwner{2}, Offline, 1, 1, 0}}
 	if !reflect.DeepEqual([]PtInfo(ptinfo), dbptInfo) {
 		t.Fatalf("got %v, exp %v", ptinfo, dbptInfo)
 	}
@@ -753,28 +753,28 @@ func TestData_createIndexGroupIfNeeded(t *testing.T) {
 				Indexes:   make([]IndexInfo, 2),
 			},
 		}}
-	ig := data.createIndexGroupIfNeeded(rpi, now.Add(-time.Hour))
+	ig := data.createIndexGroupIfNeeded(rpi, now.Add(-time.Hour), config.TSSTORE)
 	require.Equal(t, 4, len(rpi.IndexGroups))
 	require.Equal(t, &rpi.IndexGroups[0], ig)
 
-	ig = data.createIndexGroupIfNeeded(rpi, now.Add(time.Hour))
+	ig = data.createIndexGroupIfNeeded(rpi, now.Add(time.Hour), config.TSSTORE)
 	require.Equal(t, 4, len(rpi.IndexGroups))
 	require.Equal(t, &rpi.IndexGroups[1], ig)
 
-	ig = data.createIndexGroupIfNeeded(rpi, now.Add(duration+time.Hour))
+	ig = data.createIndexGroupIfNeeded(rpi, now.Add(duration+time.Hour), config.TSSTORE)
 	require.Equal(t, 4, len(rpi.IndexGroups))
 	require.Equal(t, &rpi.IndexGroups[2], ig)
 
-	ig = data.createIndexGroupIfNeeded(rpi, now.Add(2*duration+time.Hour))
+	ig = data.createIndexGroupIfNeeded(rpi, now.Add(2*duration+time.Hour), config.TSSTORE)
 	require.Equal(t, 4, len(rpi.IndexGroups))
 	require.Equal(t, &rpi.IndexGroups[3], ig)
 
-	ig = data.createIndexGroupIfNeeded(rpi, now.Add(3*duration+time.Hour))
+	ig = data.createIndexGroupIfNeeded(rpi, now.Add(3*duration+time.Hour), config.TSSTORE)
 	require.Equal(t, 5, len(rpi.IndexGroups))
 	require.Equal(t, &rpi.IndexGroups[4], ig)
 
 	rpi.IndexGroups = nil
-	ig = data.createIndexGroupIfNeeded(rpi, now)
+	ig = data.createIndexGroupIfNeeded(rpi, now, config.TSSTORE)
 	require.Equal(t, 1, len(rpi.IndexGroups))
 	require.Equal(t, &rpi.IndexGroups[0], ig)
 }
@@ -1215,5 +1215,43 @@ func TestUpdateShardInfo(t *testing.T) {
 	s := data.Databases["db0"].RetentionPolicies["rp0"].ShardGroups[0].Shards[0]
 	if s.DownSampleID != 2 || s.DownSampleLevel != 2 {
 		t.Fatal()
+	}
+}
+
+func TestData_RegisterQueryIDOffset(t *testing.T) {
+	type fields struct {
+		QueryIDInit map[SQLHost]uint64
+	}
+	type args struct {
+		host SQLHost
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   uint64
+	}{
+		{
+			name:   "Success",
+			fields: fields{QueryIDInit: map[SQLHost]uint64{"127.0.0.1:1234": 0, "127.0.0.2:1234": QueryIDSpan}},
+			args:   args{host: "127.0.0.1:7890"},
+			want:   QueryIDSpan * 2,
+		},
+		{
+			name:   "DuplicateRegister",
+			fields: fields{QueryIDInit: map[SQLHost]uint64{"127.0.0.1:1234": 0}},
+			args:   args{host: "127.0.0.1:1234"},
+			want:   0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &Data{
+				QueryIDInit: tt.fields.QueryIDInit,
+			}
+			err := data.RegisterQueryIDOffset(tt.args.host)
+			assert2.NoError(t, err)
+			assert(data.QueryIDInit[tt.args.host] == tt.want, "register failed")
+		})
 	}
 }

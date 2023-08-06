@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
 	"path"
@@ -26,7 +27,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	set "github.com/deckarep/golang-set"
@@ -42,6 +42,7 @@ import (
 	"github.com/openGemini/openGemini/lib/logger"
 	"github.com/openGemini/openGemini/lib/rand"
 	"github.com/openGemini/openGemini/lib/statisticsPusher/statistics"
+	"github.com/openGemini/openGemini/lib/sysinfo"
 	"github.com/openGemini/openGemini/lib/util"
 	"github.com/openGemini/openGemini/open_src/influx/influxql"
 	meta2 "github.com/openGemini/openGemini/open_src/influx/meta"
@@ -84,7 +85,6 @@ const (
 	IndexGroupDeletedExpiration = -2 * 7 * 24 * time.Hour
 
 	RPCReqTimeout       = 10 * time.Second
-	HttpReqTimeout      = 10 * time.Second
 	HttpSnapshotTimeout = 4 * time.Second
 
 	//for lock user
@@ -117,6 +117,7 @@ var (
 	RetryGetUserInfoTimeout = 5 * time.Second
 	RetryExecTimeout        = 60 * time.Second
 	RetryReportTimeout      = 60 * time.Second
+	HttpReqTimeout          = 10 * time.Second
 )
 
 var DefaultTypeMapper = influxql.MultiTypeMapper(
@@ -214,6 +215,7 @@ type MetaClient interface {
 	GetMeasurementsInfoStore(dbName string, rpName string) (*meta2.MeasurementsInfo, error)
 	TagArrayEnabledFromServer(dbName string) (bool, error)
 	GetAllMst(dbName string) []string
+	RetryRegisterQueryIDOffset(host string) (uint64, error)
 }
 
 type LoadCtx struct {
@@ -2009,6 +2011,48 @@ func (c *Client) CreateShardGroup(database, policy string, timestamp time.Time, 
 	return rpi.ShardGroupByTimestampAndEngineType(timestamp, engineType), nil
 }
 
+func (c *Client) GetShardInfoByTime(database, retentionPolicy string, t time.Time, ptIdx int, nodeId uint64, engineType config.EngineType) (*meta2.ShardInfo, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	rp, err := c.cacheData.RetentionPolicy(database, retentionPolicy)
+	if err != nil {
+		return nil, err
+	}
+	if rp.MarkDeleted {
+		return nil, errno.NewError(errno.RpNotFound)
+	}
+	shardGroup := rp.ShardGroupByTimestampAndEngineType(t, engineType)
+	if shardGroup == nil {
+		return nil, errno.NewError(errno.ShardNotFound)
+	}
+	if shardGroup.Deleted() {
+		return nil, errno.NewError(errno.ShardNotFound)
+	}
+
+	info := c.cacheData.PtView[database]
+	if info == nil {
+		return nil, fmt.Errorf("db %v in PtView not exist", database)
+	}
+	cnt, ptId := 0, uint32(math.MaxUint32)
+	for i := range info {
+		if info[i].Owner.NodeID == nodeId {
+			if ptIdx == cnt {
+				ptId = info[i].PtId
+				cnt++
+				break
+			} else {
+				cnt++
+			}
+		}
+	}
+	if cnt == 0 || ptId == math.MaxUint32 {
+		return nil, errors.New("nodeId cannot find pt")
+	}
+
+	shard := shardGroup.Shards[ptId]
+	return &shard, nil
+}
+
 func (c *Client) GetAliveShards(database string, sgi *meta2.ShardGroupInfo) []int {
 	c.mu.RLock()
 	aliveShardIdxes := make([]int, 0, c.cacheData.ClusterPtNum)
@@ -3177,9 +3221,7 @@ func (c *Client) retryVerifyDataNodeStatus() error {
 func (c *Client) Suicide(err error) {
 	c.logger.Error("Suicide for fault data node", zap.Error(err))
 	time.Sleep(errSleep)
-	if e := syscall.Kill(syscall.Getpid(), syscall.SIGKILL); e != nil {
-		panic(fmt.Sprintf("FATAL: cannot send SIGKILL to itself: %v", e))
-	}
+	sysinfo.Suicide()
 }
 
 func (c *Client) RetryDBBriefInfo(dbName string) ([]byte, error) {
@@ -3247,6 +3289,64 @@ func (c *Client) TagArrayEnabled(db string) bool {
 	}
 
 	return c.cacheData.Databases[db].EnableTagArray
+}
+
+// RetryRegisterQueryIDOffset send a register rpc to ts-meta，request a query id offset
+func (c *Client) RetryRegisterQueryIDOffset(host string) (uint64, error) {
+	startTime := time.Now()
+	currentServer := connectedServer
+	var offset uint64
+	var ok bool
+	var err error
+
+	for {
+		c.mu.RLock()
+
+		if offset, ok = c.cacheData.QueryIDInit[meta2.SQLHost(host)]; ok {
+			c.logger.Info("current host has already registered in ts-meta")
+			c.mu.RUnlock()
+			return offset, nil
+		}
+
+		select {
+		case <-c.closing:
+			c.mu.RUnlock()
+			return 0, meta2.ErrClientClosed
+		default:
+			// we're still open, continue on
+		}
+		if currentServer >= len(c.metaServers) {
+			currentServer = 0
+		}
+		c.mu.RUnlock()
+
+		offset, err = c.registerOffset(currentServer, host)
+		if err == nil {
+			return offset, nil
+		}
+
+		currentServer++
+
+		if strings.Contains(err.Error(), "node is not the leader") {
+			continue
+		}
+
+		if time.Since(startTime).Seconds() > float64(len(c.metaServers))*HttpReqTimeout.Seconds() {
+			return 0, errors.New("register query id offset timeout")
+		}
+		time.Sleep(errSleep)
+	}
+}
+
+func (c *Client) registerOffset(currentServer int, host string) (uint64, error) {
+	callback := &RegisterQueryIDOffsetCallback{}
+	msg := message.NewMetaMessage(message.RegisterQueryIDOffsetRequestMessage, &message.RegisterQueryIDOffsetRequest{
+		Host: host})
+	err := c.SendRPCMsg(currentServer, msg, callback)
+	if err != nil {
+		return 0, err
+	}
+	return callback.Offset, nil
 }
 
 func refreshConnectedServer(currentServer int) {
